@@ -7,230 +7,262 @@ import yt_dlp
 # ==============================
 # 🔧 НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ
 # ==============================
-DOWNLOAD_PATH = os.path.curdir
-USER_AGENT = "" 
-SHOW_NO_AUDIO_VARIANTS = False  # показывать ли варианты без аудио (помечаются как "(No Audio)")
+# Скачиваем в папку "Загрузки/YTDL" в домашней директории пользователя
+DOWNLOAD_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "YTDL")
+USER_AGENT = ""  # Оставь пустым, чтобы библиотека использовала стандартный (рекомендуется)
+SHOW_NO_AUDIO_VARIANTS = False  # Показывать ли варианты "(No Audio)"
 # ==============================
 
 
 def validate_url(url):
+    """Простая проверка формата ссылки, основную валидацию делает yt-dlp"""
+    if not url:
+        return False
+    # Расширенный regex для поддержки youtube.com, youtu.be, shorts и т.д.
     youtube_regex = re.compile(
-        r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        r'(watch\?v=|embed/|v/|shorts/|.+\?v=)?([^&=%\?]{11})'
+        r'^(https?://)?(www\.|m\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/.+$'
     )
     return bool(youtube_regex.match(url))
 
 
 def has_ffmpeg():
+    """Проверяет наличие FFmpeg в системе"""
     return shutil.which("ffmpeg") is not None
 
 
 def get_video_info(url):
-    """Получает метаданные без загрузки"""
+    """Получает метаданные видео"""
     ydl_opts = {
         'quiet': True,
-        'no_warnings': False,
+        'no_warnings': True,
         'extract_flat': False,
-        'ignoreerrors': True,
-        'extractor_retries': 5,
-        'source_address': '0.0.0.0',
+        'ignoreerrors': True,  # Не падать при ошибке плейлиста, просто пропускать
+        'extractor_retries': 3,
     }
     if USER_AGENT:
         ydl_opts['http_headers'] = {'User-Agent': USER_AGENT}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        try:
+            return ydl.extract_info(url, download=False)
+        except Exception:
+            return None
 
 
 def get_available_qualities(info, show_no_audio=False):
     """
-    Возвращает Ordered dict / список (label -> format_selector).
-    Правила:
-     - Для каждой реально доступной высоты создаём вариант video+audio:
-         bestvideo[height={H}]+bestaudio/best[height={H}]
-     - Если на той же высоте есть fps>=60 — добавляем метку "H 60fps"
-     - Добавляем "Лучшее доступное" = bestvideo+bestaudio/best
-     - Добавляем "Аудио (MP3)" = bestaudio/best
-     - Если show_no_audio=True — добавляем видео-only варианты (помечены (No Audio))
+    Анализирует форматы и возвращает словарь: "Название качества" -> "Строка селектора"
     """
     from collections import OrderedDict, defaultdict
 
     qualities = OrderedDict()
-
-    formats = info.get("formats") or []
-    # Соберём данные по высотам: для каждой высоты — есть ли fps>=60 и есть ли вообще video formats
-    heights = defaultdict(lambda: {"has_video": False, "has_60fps": False})
+    formats = info.get("formats", [])
+    
+    # Словарь: высота -> {есть ли видео, есть ли 60fps}
+    heights_data = defaultdict(lambda: {"has_video": False, "has_60fps": False})
 
     for f in formats:
-        # пропускаем форматы без ссылки или без видеокодека (для видео)
-        if f.get("vcodec") and f.get("height"):
+        # Фильтруем форматы: должны быть vcodec != none и height != none
+        if f.get("vcodec") != "none" and f.get("height"):
             h = f.get("height")
-            heights[h]["has_video"] = True
-            fps = f.get("fps") or 0
-            if fps >= 60:
-                heights[h]["has_60fps"] = True
+            heights_data[h]["has_video"] = True
+            if f.get("fps") and f.get("fps") >= 60:
+                heights_data[h]["has_60fps"] = True
 
-    # Сортируем высоты по убыванию
-    sorted_heights = sorted([h for h in heights.keys()], reverse=True)
+    # Сортируем высоты от большего к меньшему
+    sorted_heights = sorted(heights_data.keys(), reverse=True)
 
-    # Формируем записи: сначала fps>=60 версии (если есть), затем обычные
     for h in sorted_heights:
-        if heights[h]["has_60fps"]:
+        # Вариант 60 FPS
+        if heights_data[h]["has_60fps"]:
             label = f"{h}p 60fps"
-            selector = f"bestvideo[height={h}][fps>=60]+bestaudio/best[height={h}]"
+            # Строгий выбор: видео этой высоты с fps>=60 + лучшее аудио
+            selector = f"bestvideo[height={h}][fps>=60]+bestaudio/bestvideo[height={h}][fps>=60]"
             qualities[label] = selector
 
-        # стандартный вариант для этой высоты
+        # Обычный вариант для этой высоты
         label = f"{h}p"
-        selector = f"bestvideo[height={h}]+bestaudio/best[height={h}]"
+        # Выбираем видео этой высоты + лучшее аудио. 
+        # Если аудио нет (merge fail), fallback на просто видео этой высоты (но yt-dlp обычно качает 2 файла)
+        selector = f"bestvideo[height={h}]+bestaudio/bestvideo[height={h}]"
         qualities[label] = selector
 
-        # если пользователь хочет видеть видео-only варианты — добавляем помеченный вариант
+        # Вариант без звука (если включено в настройках)
         if show_no_audio:
-            no_audio_label = f"{h}p (No Audio)"
-            no_audio_selector = f"bestvideo[height={h}]"
-            qualities[no_audio_label] = no_audio_selector
+            label_na = f"{h}p (No Audio)"
+            selector_na = f"bestvideo[height={h}]"
+            qualities[label_na] = selector_na
 
-    # fallback - лучшее доступное (yt-dlp сам выберет)
-    qualities["Лучшее доступное"] = "bestvideo+bestaudio/best"
-
-    # аудио только
-    qualities["Аудио (MP3)"] = "bestaudio/best"
+    # Добавляем общие варианты
+    qualities["Лучшее доступное (Auto)"] = "bestvideo+bestaudio/best"
+    qualities["Только Аудио (MP3)"] = "bestaudio/best"
 
     return qualities
 
 
 def choose_quality(qualities):
-    print("\nДоступные варианты качества:\n" + "=" * 40)
+    """Интерактивное меню выбора качества"""
+    print("\n📋 Доступные варианты:\n" + "-" * 30)
     keys = list(qualities.keys())
     for i, label in enumerate(keys, start=1):
         print(f"{i:2d}) {label}")
-    print("=" * 40)
+    print("-" * 30)
+    
     while True:
         try:
-            choice = int(input(f"Выберите качество (1-{len(keys)}): ").strip())
+            choice_input = input(f"👉 Выберите номер (1-{len(keys)}): ").strip()
+            if not choice_input: continue
+            
+            choice = int(choice_input)
             if 1 <= choice <= len(keys):
                 key = keys[choice - 1]
                 return qualities[key], key
             else:
-                print("Введите число в диапазоне.")
+                print("⚠️ Число вне диапазона.")
         except ValueError:
-            print("Введите корректное число.")
+            print("⚠️ Введите целое число.")
         except KeyboardInterrupt:
-            print("\nОтмена.")
+            print("\nВыход.")
             sys.exit(0)
 
 
 def progress_hook(d):
-    if d.get('status') == 'downloading':
-        percent = d.get('_percent_str', 'N/A')
-        speed = d.get('_speed_str', 'N/A')
-        eta = d.get('_eta_str', 'N/A')
-        print(f"\rЗагрузка: {percent} | Скорость: {speed} | ETA: {eta}", end='', flush=True)
-    elif d.get('status') == 'finished':
-        print(f"\n✓ Загрузка завершена: {os.path.basename(d.get('filename',''))}")
+    """Хук для отображения прогресса"""
+    if d['status'] == 'downloading':
+        percent = d.get('_percent_str', '').strip()
+        speed = d.get('_speed_str', '').strip()
+        eta = d.get('_eta_str', '').strip()
+        # \r возвращает каретку в начало строки, чтобы обновлять одну строку
+        sys.stdout.write(f"\r⏳ Загрузка: {percent} | Скорость: {speed} | ETA: {eta}   ")
+        sys.stdout.flush()
+    elif d['status'] == 'finished':
+        sys.stdout.write("\n🔄 Обработка / Склейка файлов...\n")
 
 
 def download_video(url, format_selector, quality_label):
-    """
-    Всегда стараемся скачивать video+audio и склеивать в mp4.
-    Если выбран "Аудио (MP3)" — конвертируем в mp3.
-    Если выбран вариант (No Audio) — скачиваем видео-only (но это опционально и помечено).
-    """
-    is_audio_only = format_selector.strip().startswith("bestaudio")
-    is_video_only = "bestvideo[" in format_selector and "+bestaudio" not in format_selector and "bestaudio" not in format_selector
-
-    # Формат файла и опции постобработки
-    if is_audio_only:
-        out_ext = "mp3"
-    else:
-        out_ext = "mp4"
-
+    is_audio_only = format_selector.startswith("bestaudio")
+    
+    # Опции для yt-dlp
     ydl_opts = {
         'format': format_selector,
-        'outtmpl': os.path.join(DOWNLOAD_PATH, '%(title)s.%(ext)s'),
-        'nocheckcertificate': True,
+        # Сохраняем в указанную папку, имя файла очищается от спецсимволов
+        'paths': {'home': DOWNLOAD_PATH},
+        'outtmpl': '%(title)s.%(ext)s',
+        
+        # Санитизация имен файлов (чтобы Windows не ругалась на "?" или "|")
+        'restrictfilenames': True,  # Убирает пробелы и не-ASCII (опционально)
+        'windowsfilenames': True,   # Убирает запрещенные в Windows символы
+        
+        'noplaylist': True,
         'ignoreerrors': False,
-        'no_warnings': False,
+        'no_warnings': True,
         'progress_hooks': [progress_hook],
-        'retries': 5,
-        'fragment_retries': 5,
-        'http_chunk_size': 10485760,
-        'source_address': '0.0.0.0',
+        
+        # Настройки сети
+        'retries': 10,
+        'fragment_retries': 10,
     }
 
-    # если нужно — добавляем User-Agent заголовок
     if USER_AGENT:
         ydl_opts['http_headers'] = {'User-Agent': USER_AGENT}
 
-    # Если это аудио — добавляем постобработчик для конвертации в mp3
+    # Настройки для АУДИО
     if is_audio_only:
-        # потребует ffmpeg/avconv
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }]
+    # Настройки для ВИДЕО (склейка в mp4)
     else:
         ydl_opts['merge_output_format'] = 'mp4'
 
-    try:
-        # предупреждение про ffmpeg, если потребуется склеить и он отсутствует
-        if (not is_audio_only) and ('+bestaudio' in format_selector or 'bestaudio' in format_selector):
-            if not has_ffmpeg():
-                print("\n⚠️ Warning: ffmpeg не найден в PATH. Если его нет, yt-dlp может сохранить раздельные файлы (video + audio), но не склеит их.")
-                print("   Установи ffmpeg и добавь в PATH, чтобы автоматически получать единый mp4 с вшитым звуком.")
+    # Проверка FFmpeg перед загрузкой "сложных" форматов
+    # Если мы качаем bestvideo+bestaudio, нам нужен FFmpeg для склейки
+    need_ffmpeg = (not is_audio_only) and ('+bestaudio' in format_selector)
+    ffmpeg_available = has_ffmpeg()
 
-        print(f"\nНачинаем загрузку: {quality_label}")
+    if need_ffmpeg and not ffmpeg_available:
+        print("\n⚠️  ВНИМАНИЕ: FFmpeg не найден!")
+        print("   Видео будет скачано двумя файлами: видео (без звука) и аудио отдельно.")
+        print("   Установите FFmpeg и добавьте его в PATH, чтобы получать один MP4 файл.")
+        # Убираем требование склейки, чтобы не вызывать ошибку
+        if 'merge_output_format' in ydl_opts:
+            del ydl_opts['merge_output_format']
+
+    try:
+        print(f"\n🚀 Начинаем загрузку: {quality_label}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        print(f"\n✅ Готово: {quality_label}")
+        print(f"\n✅ Успешно сохранено в: {DOWNLOAD_PATH}")
         return True
     except Exception as e:
-        print(f"\n❌ Ошибка загрузки: {e}")
+        print(f"\n❌ Ошибка при загрузке: {e}")
         return False
 
 
 def main():
+    # Очистка консоли (кроссплатформенная)
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
     print("=" * 60)
-    print("🎥 YouTube Downloader — обязательно с аудио (по умолчанию)")
+    print("🎥 YouTube Downloader (Safe Fix)")
     print("=" * 60)
 
-    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
-    print(f"📁 Папка для загрузок: {DOWNLOAD_PATH}")
-    print("🧩 User-Agent:", USER_AGENT if USER_AGENT else "по умолчанию")
-    print("⚙️  Показать варианты без аудио:", "Да" if SHOW_NO_AUDIO_VARIANTS else "Нет")
+    # Проверка создания папки
+    try:
+        os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+    except OSError as e:
+        print(f"❌ Ошибка создания папки {DOWNLOAD_PATH}: {e}")
+        return
+
+    print(f"📂 Папка: {DOWNLOAD_PATH}")
+    if not has_ffmpeg():
+        print("⚠️  FFmpeg не обнаружен. Склейка видео+аудио невозможна (будут раздельные файлы).")
+    else:
+        print("✅ FFmpeg обнаружен. Видео и аудио будут склеены.")
 
     while True:
-        url = input("\n🔗 Введите ссылку на видео (или 'exit'): ").strip()
-        if not url:
-            print("❌ Пустая ссылка.")
-            continue
-        if url.lower() in ['exit', 'quit', 'выход']:
-            break
+        url = input("\n🔗 Вставьте ссылку (или 'q' для выхода): ").strip()
+        
+        if not url: continue
+        if url.lower() in ['q', 'quit', 'exit', 'выход']: break
+        
         if not validate_url(url):
-            print("❌ Неверная ссылка.")
+            print("❌ Ссылка не похожа на YouTube.")
             continue
 
+        print("\n🔎 Получаем данные о видео...")
         try:
             info = get_video_info(url)
             if not info:
-                print("❌ Не удалось получить информацию о видео.")
+                print("❌ Видео не найдено или недоступно.")
                 continue
-            print(f"\n📹 {info.get('title', 'Без названия')} — {info.get('uploader', 'Неизвестно')}")
+            
+            title = info.get('title', 'Без названия')
+            author = info.get('uploader', 'Неизвестно')
+            duration = info.get('duration_string', 'N/A')
+            print(f"🎬 {title}")
+            print(f"👤 {author} | ⏱ {duration}")
+
+            qualities = get_available_qualities(info, show_no_audio=SHOW_NO_AUDIO_VARIANTS)
+            if not qualities:
+                print("❌ Не найдено подходящих форматов для скачивания.")
+                continue
+
+            selector, label = choose_quality(qualities)
+            download_video(url, selector, label)
+
         except Exception as e:
-            print(f"Ошибка получения информации: {e}")
-            continue
+            print(f"❌ Непредвиденная ошибка: {e}")
+            import traceback
+            traceback.print_exc()
 
-        qualities = get_available_qualities(info, show_no_audio=SHOW_NO_AUDIO_VARIANTS)
-        fmt, label = choose_quality(qualities)
-        success = download_video(url, fmt, label)
-
-        if not success:
-            print("\n⚠️ Попробуй другой вариант качества или проверь подключение/ffmpeg.")
-        if input("\nСкачать ещё? (y/n): ").lower().strip() not in ['y', 'yes', 'д', 'да']:
-            break
+        print("-" * 60)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n👋 Программа остановлена пользователем.")
